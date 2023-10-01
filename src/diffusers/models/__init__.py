@@ -34,6 +34,7 @@ if is_torch_available():
     _import_structure["unet_1d"] = ["UNet1DModel"]
     _import_structure["unet_2d"] = ["UNet2DModel"]
     _import_structure["unet_2d_condition"] = ["UNet2DConditionModel"]
+    _import_structure["unet_2d_condition_class"] = ["UNet2DClassConditionModel"]
     _import_structure["unet_3d_condition"] = ["UNet3DConditionModel"]
     _import_structure["vq_model"] = ["VQModel"]
 
@@ -59,6 +60,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
         from .unet_1d import UNet1DModel
         from .unet_2d import UNet2DModel
         from .unet_2d_condition import UNet2DConditionModel
+        from .unet_2d_condition_class import UNet2DClassConditionModel
         from .unet_3d_condition import UNet3DConditionModel
         from .vq_model import VQModel
 
