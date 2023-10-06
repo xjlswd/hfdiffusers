@@ -48,8 +48,8 @@ from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers import UNet2DClassConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
-from diffusers.utils import check_min_version, randn_tensor
-
+from diffusers.utils import check_min_version
+from diffusers.utils.torch_utils import randn_tensor
 from transformers.utils import ContextManagers
 import transformers
 

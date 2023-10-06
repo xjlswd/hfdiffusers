@@ -14,23 +14,21 @@
 # See the License for the specific language governing permissions and
 import argparse
 import logging
-import copy
 import math
 import os
 import random
+import copy
 from pathlib import Path
 from typing import Optional
-import glob
+
 import shutil
-import random
-from io import BytesIO
 
 import accelerate
 import datasets
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
+from torchvision.transforms import functional as FF
 import torch.utils.checkpoint
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
@@ -40,18 +38,19 @@ from datasets import load_dataset
 from packaging import version
 from torchvision import transforms
 from torchvision.utils import save_image
-from torchvision.transforms.functional import to_tensor
+from torchvision.datasets import ImageFolder
 from tqdm.auto import tqdm
 from PIL import Image
 
+from mypipeline import MyPipeline
 import diffusers
-from diffusers import DDPMScheduler
-from diffusers import UNet2DModel
+from diffusers import AutoencoderKL, DDPMScheduler
+from diffusers import UNet2DClassConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
 from diffusers.utils.torch_utils import randn_tensor
-
+from transformers.utils import ContextManagers
 import transformers
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -140,7 +139,7 @@ def parse_args():
     parser.add_argument(
         "--num_class",
         type=int,
-        default=1000,
+        default=3,
         help=(
             "The number of classes in the dataset. This is used to create the class embeddings."
         ),
@@ -396,7 +395,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler(2000, 0.00085, 0.012, "scaled_linear")
+    noise_scheduler = DDPMScheduler(1000, 0.00085, 0.012, "scaled_linear")
 
     def deepspeed_zero_init_disabled_context_manager():
         """
@@ -414,45 +413,39 @@ def main():
 
     # with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
     #     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-mse")
-    # unet = UNet2DModel(
-    #     args.resolution,
-    #     in_channels=6,
-    #     out_channels=3,
-    #     attention_head_dim=64,
-    #     norm_num_groups=32,
-    #     down_block_types=(
-    #         "DownBlock2D",
-    #         "DownBlock2D",
-    #         "DownBlock2D",
-    #         "DownBlock2D",
-    #         "AttnDownBlock2D",
-    #         "AttnDownBlock2D",
-    #     ),
-    #     up_block_types=(
-    #         "AttnUpBlock2D",
-    #         "AttnUpBlock2D",
-    #         "UpBlock2D",
-    #         "UpBlock2D",
-    #         "UpBlock2D",
-    #         "UpBlock2D",
-    #     ),
-    #     block_out_channels=(64, 128, 256, 512, 512, 1024),
-    # )
-    # unet.load_state_dict(
-        # torch.load("results/bean_sr_64to256/unet.pt", map_location=torch.device("cpu"))
-    # )
-    unet = UNet2DModel.from_pretrained("results/xray_refine/checkpoint-14000/unet")
-    if accelerator.is_main_process:
-        print(sum([p.numel() for p in unet.parameters() if p.requires_grad]))
+    num_class_embeds = args.num_class
+    unet = UNet2DClassConditionModel(
+        64,
+        in_channels=3,
+        out_channels=3,
+        cross_attention_dim=512,
+        attention_head_dim=(8, 16, 32, 64),
+        num_class_embeds=num_class_embeds,
+        down_block_types=(
+            "DownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+            "CrossAttnDownBlock2D",
+        ),
+        up_block_types=(
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
+            "CrossAttnUpBlock2D",
+            "UpBlock2D",
+        ),
+        block_out_channels=(64, 128, 256, 512),
+        transformer_layers_per_block=(1, 1, 1, 1),
+    )
+    unet.load_state_dict(torch.load("results/xray_256/unet.pt",map_location=torch.device("cpu")))
 
     # Create EMA for the unet.
     if args.use_ema:
-        # ema_unet = copy.deepcopy(unet)
-        ema_unet = UNet2DModel.from_pretrained("results/xray_refine/checkpoint-14000/unet_ema")
+        ema_unet = copy.deepcopy(unet)
+        ema_unet.load_state_dict(torch.load("results/xray_256/unet.pt",map_location=torch.device("cpu")))
 
         ema_unet = EMAModel(
             ema_unet.parameters(),
-            model_cls=UNet2DModel,
+            model_cls=UNet2DClassConditionModel,
             model_config=ema_unet.config,
         )
 
@@ -500,7 +493,7 @@ def main():
         def load_model_hook(models, input_dir):
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DModel
+                    os.path.join(input_dir, "unet_ema"), UNet2DClassConditionModel
                 )
                 ema_unet.load_state_dict(load_model.state_dict())
                 ema_unet.to(accelerator.device)
@@ -511,7 +504,9 @@ def main():
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = UNet2DModel.from_pretrained(input_dir, subfolder="unet")
+                load_model = UNet2DClassConditionModel.from_pretrained(
+                    input_dir, subfolder="unet"
+                )
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -543,38 +538,37 @@ def main():
     )
 
     # data
-    class ImageData(Dataset):
-        def __init__(
-            self,
-            img_folder,
-        ):
-            self.sr_folder = img_folder + "/sr_imgs"
-            self.hr_folder = img_folder + "/hr_imgs"
-            self.sr_img = glob.glob(self.sr_folder + "/*.png")
-            self.dummy_len = len(self.sr_img)
 
-        def get_img_patches(self, sr_img_file):
-            sr_img = Image.open(sr_img_file).convert("RGB")
-            hr_img = Image.open(sr_img_file.replace("sr_imgs", "hr_imgs")).convert(
-                "RGB"
-            )
-            return sr_img, hr_img
-
-        def __len__(self):
-            return self.dummy_len  # len(self.img)
-
-        def __getitem__(self, idx):
-            sr_img = self.sr_img[idx]
-            sr_img, hr_img = self.get_img_patches(sr_img)
-            return to_tensor(sr_img), to_tensor(hr_img)
-
-    train_dataset = ImageData(
-        "data/"+ args.train_data_dir,
+    def pad_to_square(img):
+        w, h = img.size
+        if w == h:
+            return img
+        elif w > h:
+            return FF.pad(img, (0,(w - h)//2),fill=255)
+        else:
+            return FF.pad(img, ((h - w)//2,0),fill=255)
+            
+    train_transforms = transforms.Compose(
+        [
+            pad_to_square,
+            transforms.Resize(args.resolution),
+            transforms.CenterCrop(args.resolution),
+            transforms.RandomHorizontalFlip(),
+            # transforms.RandomVerticalFlip(),
+            transforms.ToTensor(),
+            # transforms.Normalize(
+            #     mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True
+            # ),
+        ]
     )
-    train_dataloader = DataLoader(
-        dataset=train_dataset,
-        batch_size=args.train_batch_size,
+
+    train_dataset = ImageFolder("data/" + args.train_data_dir, transform=train_transforms)
+
+    # DataLoaders creation:
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
         shuffle=True,
+        batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
     # Scheduler and math around the number of training steps.
@@ -697,31 +691,30 @@ def main():
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                lr_img = batch[0].to(weight_dtype)
-                hr_img = batch[1].to(weight_dtype)
-                lr_img = normalize_to_neg_one_to_one(lr_img)
-                hr_img = normalize_to_neg_one_to_one(hr_img)
+                latents = batch[0].to(weight_dtype)
+                latents = normalize_to_neg_one_to_one(latents)
+                labels = batch[1]
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(hr_img)
+                noise = torch.randn_like(latents)
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
-                        (hr_img.shape[0], hr_img.shape[1], 1, 1),
-                        device=hr_img.device,
+                        (latents.shape[0], latents.shape[1], 1, 1),
+                        device=latents.device,
                     )
                 if args.input_perturbation:
                     new_noise = noise + args.input_perturbation * torch.randn_like(
                         noise
                     )
-                bsz = hr_img.shape[0]
+                bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 # timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = torch.randint(
                     0,
                     noise_scheduler.config.num_train_timesteps,
                     (bsz,),
-                    device=hr_img.device,
+                    device=latents.device,
                 )
                 timesteps = timesteps.long()
 
@@ -729,10 +722,10 @@ def main():
                 # (this is the forward diffusion process)
                 if args.input_perturbation:
                     noisy_latents = noise_scheduler.add_noise(
-                        hr_img, new_noise, timesteps
+                        latents, new_noise, timesteps
                     )
                 else:
-                    noisy_latents = noise_scheduler.add_noise(hr_img, noise, timesteps)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -743,10 +736,15 @@ def main():
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
+
+                drop_ids = (
+                    torch.rand(labels.shape[0], device=labels.device)
+                    < args.dropout_prob
+                )
+                labels = torch.where(drop_ids, args.num_class, labels)
+
                 # Predict the noise residual and compute loss
-                model_pred = unet(
-                    torch.cat([noisy_latents, lr_img], dim=1), timesteps
-                ).sample
+                model_pred = unet(noisy_latents, timesteps, class_labels=labels).sample
                 if args.snr_gamma is None:
                     loss = F.mse_loss(
                         model_pred.float(), target.float(), reduction="mean"
@@ -850,49 +848,36 @@ def main():
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(model.parameters())
                     ema_unet.copy_to(model.parameters())
-
+                class_label = torch.tensor(
+                    [0,0,0,1,1,1,2,2, 2,],
+                    device=model.device,
+                    dtype=torch.long,
+                )
                 generator = torch.Generator(device=unet.device).manual_seed(0)
-                num_inference_steps = 2000
+                num_inference_steps = 1000
                 # output_type = "tensor"
                 # guidance_scale = 1.0
-                noisy_latents = randn_tensor(
-                    (2, 3, 256, 256),
+                image = randn_tensor(
+                    (9, 3, 256, 256),
                     generator=generator,
-                    device=lr_img.device,
-                    dtype=lr_img.dtype,
+                    device=latents.device,
+                    dtype=latents.dtype,
                 )
-                lr_images = glob.glob("data/valid_refine/sr/*.png")
-                hr_images = glob.glob("data/valid_refine/hr/*.png")
-                lr_imgs = []
-                hr_imgs = []
-                for lr_image in lr_images:
-                    img = Image.open(lr_image)
-                    lr_imgs.append(img)
-                for hr_image in hr_images:
-                    img = Image.open(hr_image)
-                    hr_imgs.append(img)
-                hr_imgs = torch.stack([to_tensor(img) for img in hr_imgs])
-                lr_imgs = torch.stack([to_tensor(img) for img in lr_imgs])
-
-                lr_imgs = normalize_to_neg_one_to_one(lr_imgs)
-                lr_imgs = lr_imgs.to(
-                    device=noisy_latents.device, dtype=noisy_latents.dtype
-                )
-
                 noise_scheduler.set_timesteps(num_inference_steps)
                 with torch.no_grad():
                     for t in tqdm(noise_scheduler.timesteps):
                         model_output = unet(
-                            torch.cat([noisy_latents, lr_imgs], dim=1),
-                            timestep=t.unsqueeze(0).to(lr_img.device),
+                            image,
+                            timestep=t.unsqueeze(0).to(image.device),
+                            class_labels=class_label,
                         ).sample
-                        noisy_latents = noise_scheduler.step(
-                            model_output, t, noisy_latents, generator=generator
+                        image = noise_scheduler.step(
+                            model_output, t, image, generator=generator
                         ).prev_sample
                     #     image = 1 / vae.config.scaling_factor * image
                     #     image = image.to(dtype=latents.dtype)
                     #     image = vae.decode(image).sample
-                    image = unnormalize_to_one_to_one(noisy_latents).clamp(0, 1).cpu()
+                    image = unnormalize_to_one_to_one(image).clamp(0, 1).cpu()
                     image = image.to(torch.float32)
                 # pipe = MyPipeline(
                 #     vae=vae,
@@ -912,7 +897,7 @@ def main():
                 if not os.path.exists(os.path.join(args.output_dir, "images")):
                     os.makedirs(os.path.join(args.output_dir, "images"))
 
-                save_image(torch.cat((hr_imgs, image), dim=0), output_name, nrow=2)
+                save_image(image, output_name)
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
